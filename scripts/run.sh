@@ -1,287 +1,209 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# run.sh — Convert between config file formats
-# Usage: ./run.sh [OPTIONS] [FILE]
+# config-convert: convert between config formats
 
-FROM_FMT="auto"
-TO_FMT="json"
+FROM_FMT=""
+TO_FMT=""
 PRETTY=false
 INPUT_FILE=""
 
+usage() {
+  cat <<'EOF'
+Usage: config-convert [OPTIONS] <file>
+
+Convert between config formats: JSON, YAML, TOML, INI.
+
+Options:
+  --from <fmt>   Input format (json, yaml, toml, ini). Auto-detected if omitted.
+  --to <fmt>     Output format (json, yaml, toml, ini). Required.
+  --pretty       Pretty-print output
+  --help         Show this help message
+
+Examples:
+  config-convert --to yaml config.json
+  config-convert --from json --to toml config.json
+  cat config.json | config-convert --from json --to yaml -
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --from) FROM_FMT="$2"; shift 2 ;;
-    --to) TO_FMT="$2"; shift 2 ;;
+    --from)   FROM_FMT="$2"; shift 2 ;;
+    --to)     TO_FMT="$2"; shift 2 ;;
     --pretty) PRETTY=true; shift ;;
-    --help)
-      echo "Usage: run.sh [OPTIONS] [FILE]"
-      echo ""
-      echo "Convert between config file formats."
-      echo ""
-      echo "Options:"
-      echo "  --from FORMAT   Input format: json, yaml, toml, ini, auto (default: auto)"
-      echo "  --to FORMAT     Output format: json, yaml, toml, ini (default: json)"
-      echo "  --pretty        Pretty-print output"
-      echo "  --help          Show this help"
-      echo ""
-      echo "Supported: JSON, YAML, TOML, INI"
-      exit 0
-      ;;
-    -*) echo "Error: unknown option: $1" >&2; exit 2 ;;
-    *)
-      if [[ -z "$INPUT_FILE" ]]; then
-        INPUT_FILE="$1"; shift
-      else
-        echo "Error: unexpected argument: $1" >&2; exit 2
-      fi
-      ;;
+    --help)   usage; exit 0 ;;
+    -*)       echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    *)        INPUT_FILE="$1"; shift ;;
   esac
 done
 
+if [ -z "$TO_FMT" ]; then
+  echo "Error: --to format is required" >&2
+  usage >&2
+  exit 1
+fi
+
+if [ -z "$INPUT_FILE" ]; then
+  echo "Error: no input file specified" >&2
+  usage >&2
+  exit 1
+fi
+
+# Auto-detect format from extension
+if [ -z "$FROM_FMT" ] && [ "$INPUT_FILE" != "-" ]; then
+  ext="${INPUT_FILE##*.}"
+  case "$ext" in
+    json)        FROM_FMT="json" ;;
+    yaml|yml)    FROM_FMT="yaml" ;;
+    toml)        FROM_FMT="toml" ;;
+    ini|cfg|conf) FROM_FMT="ini" ;;
+    *)           echo "Error: cannot detect format from extension '.$ext'. Use --from." >&2; exit 1 ;;
+  esac
+fi
+
+if [ -z "$FROM_FMT" ]; then
+  echo "Error: --from format is required when reading from stdin" >&2
+  exit 1
+fi
+
+if [ "$INPUT_FILE" != "-" ] && [ ! -f "$INPUT_FILE" ]; then
+  echo "Error: file '$INPUT_FILE' does not exist" >&2
+  exit 1
+fi
+
 # Read input
-if [[ -n "$INPUT_FILE" ]]; then
-  if [[ ! -f "$INPUT_FILE" ]]; then
-    echo "Error: file not found: $INPUT_FILE" >&2
-    exit 2
-  fi
-  INPUT=$(cat "$INPUT_FILE")
-
-  # Auto-detect format from extension
-  if [[ "$FROM_FMT" == "auto" ]]; then
-    case "$INPUT_FILE" in
-      *.json) FROM_FMT="json" ;;
-      *.yaml|*.yml) FROM_FMT="yaml" ;;
-      *.toml) FROM_FMT="toml" ;;
-      *.ini|*.cfg|*.conf) FROM_FMT="ini" ;;
-      *) echo "Error: cannot auto-detect format. Use --from flag." >&2; exit 2 ;;
-    esac
-  fi
-elif [[ -t 0 ]]; then
-  echo "Error: no input provided" >&2
-  exit 2
+if [ "$INPUT_FILE" = "-" ]; then
+  INPUT_DATA=$(cat)
 else
-  INPUT=$(cat)
-  if [[ "$FROM_FMT" == "auto" ]]; then
-    # Try to guess from content
-    if echo "$INPUT" | head -1 | grep -q '^{'; then
-      FROM_FMT="json"
-    elif echo "$INPUT" | head -1 | grep -q '^\['; then
-      # Could be INI or TOML
-      if echo "$INPUT" | grep -q '^\[.*\]$'; then
-        FROM_FMT="ini"
-      fi
-    else
-      echo "Error: cannot auto-detect format from stdin. Use --from flag." >&2
-      exit 2
-    fi
-  fi
+  INPUT_DATA=$(cat "$INPUT_FILE")
 fi
 
-if [[ -z "$INPUT" ]]; then
-  echo "Error: empty input" >&2
-  exit 2
-fi
+# Write to temp file for Python
+TMPFILE=$(mktemp)
+trap 'rm -f "$TMPFILE"' EXIT
+printf '%s' "$INPUT_DATA" > "$TMPFILE"
 
-# Use Python for conversion since it has json/configparser in stdlib
-python3 << PYEOF
-import json, sys, configparser, io, re
+python3 - "$TMPFILE" "$FROM_FMT" "$TO_FMT" "$PRETTY" << 'PYEOF'
+import sys
+import json
+import configparser
+import io
 
-input_text = '''$( echo "$INPUT" | sed "s/'/'\\''/g" )'''
-from_fmt = "$FROM_FMT"
-to_fmt = "$TO_FMT"
-pretty = $( [[ "$PRETTY" == "true" ]] && echo "True" || echo "False" )
+input_file = sys.argv[1]
+from_fmt = sys.argv[2]
+to_fmt = sys.argv[3]
+pretty = sys.argv[4] == "true"
 
-def parse_json(text):
-    return json.loads(text)
-
-def parse_yaml(text):
-    # Simple YAML parser for flat/nested key-value
-    result = {}
-    current_section = result
-    indent_stack = [(0, result)]
-
-    for line in text.strip().split('\n'):
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-
-        indent = len(line) - len(line.lstrip())
-
-        # Pop stack to find parent
-        while len(indent_stack) > 1 and indent_stack[-1][0] >= indent:
-            indent_stack.pop()
-        current = indent_stack[-1][1]
-
-        if ':' in stripped:
-            key, _, val = stripped.partition(':')
-            key = key.strip()
-            val = val.strip()
-
-            if val == '' or val == '|' or val == '>':
-                # Nested section
-                new_dict = {}
-                current[key] = new_dict
-                indent_stack.append((indent, new_dict))
-            else:
-                # Remove quotes
-                if (val.startswith('"') and val.endswith('"')) or \
-                   (val.startswith("'") and val.endswith("'")):
-                    val = val[1:-1]
-                # Type coercion
-                if val.lower() == 'true':
-                    val = True
-                elif val.lower() == 'false':
-                    val = False
-                elif val.isdigit():
-                    val = int(val)
-                else:
-                    try:
-                        val = float(val)
-                    except ValueError:
-                        pass
-                current[key] = val
-
-    return result
-
-def parse_toml(text):
-    result = {}
-    current = result
-    for line in text.strip().split('\n'):
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-        if stripped.startswith('[') and stripped.endswith(']'):
-            section = stripped[1:-1].strip()
-            parts = section.split('.')
-            current = result
-            for part in parts:
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
-        elif '=' in stripped:
-            key, _, val = stripped.partition('=')
-            key = key.strip()
-            val = val.strip()
-            if (val.startswith('"') and val.endswith('"')) or \
-               (val.startswith("'") and val.endswith("'")):
-                val = val[1:-1]
-            elif val.lower() == 'true':
-                val = True
-            elif val.lower() == 'false':
-                val = False
-            elif val.isdigit():
-                val = int(val)
-            else:
-                try:
-                    val = float(val)
-                except ValueError:
-                    pass
-            current[key] = val
-    return result
-
-def parse_ini(text):
-    cp = configparser.ConfigParser()
-    cp.read_string(text)
-    result = {}
-    for section in cp.sections():
-        result[section] = dict(cp[section])
-    if cp.defaults():
-        result['DEFAULT'] = dict(cp.defaults())
-    return result
-
-def to_json(data, pretty=False):
-    indent = 2 if pretty else None
-    return json.dumps(data, indent=indent, default=str)
-
-def to_yaml(data, indent=0):
-    lines = []
-    prefix = '  ' * indent
-    if isinstance(data, dict):
-        for key, val in data.items():
-            if isinstance(val, dict):
-                lines.append(f'{prefix}{key}:')
-                lines.append(to_yaml(val, indent + 1))
-            elif isinstance(val, bool):
-                lines.append(f'{prefix}{key}: {str(val).lower()}')
-            elif isinstance(val, (int, float)):
-                lines.append(f'{prefix}{key}: {val}')
-            else:
-                lines.append(f'{prefix}{key}: "{val}"')
-    return '\n'.join(lines)
-
-def to_toml(data, section=''):
-    lines = []
-    scalars = {}
-    sections = {}
-    for key, val in data.items():
-        if isinstance(val, dict):
-            sections[key] = val
-        else:
-            scalars[key] = val
-
-    if section:
-        lines.append(f'[{section}]')
-
-    for key, val in scalars.items():
-        if isinstance(val, bool):
-            lines.append(f'{key} = {str(val).lower()}')
-        elif isinstance(val, (int, float)):
-            lines.append(f'{key} = {val}')
-        else:
-            lines.append(f'{key} = "{val}"')
-
-    for key, val in sections.items():
-        new_section = f'{section}.{key}' if section else key
-        lines.append('')
-        lines.append(to_toml(val, new_section))
-
-    return '\n'.join(lines)
-
-def to_ini(data):
-    cp = configparser.ConfigParser()
-    for section, values in data.items():
-        if isinstance(values, dict):
-            cp[section] = {k: str(v) for k, v in values.items()}
-        else:
-            if 'DEFAULT' not in dict(cp):
-                cp['main'] = {}
-            cp['main'][section] = str(values)
-    output = io.StringIO()
-    cp.write(output)
-    return output.getvalue().strip()
+with open(input_file) as f:
+    raw = f.read()
 
 # Parse input
-try:
-    if from_fmt == 'json':
-        data = parse_json(input_text)
-    elif from_fmt == 'yaml':
-        data = parse_yaml(input_text)
-    elif from_fmt == 'toml':
-        data = parse_toml(input_text)
-    elif from_fmt == 'ini':
-        data = parse_ini(input_text)
-    else:
-        print(f'Error: unknown input format: {from_fmt}', file=sys.stderr)
-        sys.exit(2)
-except Exception as e:
-    print(f'Error parsing {from_fmt}: {e}', file=sys.stderr)
+data = None
+
+if from_fmt == "json":
+    data = json.loads(raw)
+
+elif from_fmt == "yaml":
+    try:
+        import yaml
+    except ImportError:
+        print("Error: PyYAML not installed. Run: pip install pyyaml", file=sys.stderr)
+        sys.exit(1)
+    data = yaml.safe_load(raw)
+
+elif from_fmt == "toml":
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            print("Error: TOML support requires Python 3.11+ or: pip install tomli", file=sys.stderr)
+            sys.exit(1)
+    data = tomllib.loads(raw)
+
+elif from_fmt == "ini":
+    config = configparser.ConfigParser()
+    config.read_string(raw)
+    data = {}
+    for section in config.sections():
+        data[section] = dict(config[section])
+    if config.defaults():
+        data["DEFAULT"] = dict(config.defaults())
+
+else:
+    print(f"Error: unsupported input format '{from_fmt}'", file=sys.stderr)
     sys.exit(1)
 
-# Output
-try:
-    if to_fmt == 'json':
-        print(to_json(data, pretty))
-    elif to_fmt == 'yaml':
-        print(to_yaml(data))
-    elif to_fmt == 'toml':
-        print(to_toml(data))
-    elif to_fmt == 'ini':
-        print(to_ini(data))
-    else:
-        print(f'Error: unknown output format: {to_fmt}', file=sys.stderr)
-        sys.exit(2)
-except Exception as e:
-    print(f'Error converting to {to_fmt}: {e}', file=sys.stderr)
+# Write output
+if to_fmt == "json":
+    indent = 2 if pretty else None
+    print(json.dumps(data, indent=indent))
+
+elif to_fmt == "yaml":
+    try:
+        import yaml
+    except ImportError:
+        print("Error: PyYAML not installed. Run: pip install pyyaml", file=sys.stderr)
+        sys.exit(1)
+    print(yaml.dump(data, default_flow_style=not pretty, sort_keys=False), end="")
+
+elif to_fmt == "toml":
+    # Simple TOML writer
+    def write_toml(data, prefix=""):
+        lines = []
+        tables = []
+        for key, value in data.items():
+            if isinstance(value, dict):
+                tables.append((key, value))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        full_key = f"{prefix}{key}" if prefix else key
+                        lines.append(f"\n[[{full_key}]]")
+                        lines.extend(write_toml(item, ""))
+                    else:
+                        lines.append(f"{key} = {toml_value(value)}")
+                        break
+            else:
+                lines.append(f"{key} = {toml_value(value)}")
+        for key, value in tables:
+            full_key = f"{prefix}{key}" if prefix else key
+            lines.append(f"\n[{full_key}]")
+            lines.extend(write_toml(value, f"{full_key}."))
+        return lines
+
+    def toml_value(v):
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
+        if isinstance(v, str):
+            return f'"{v}"'
+        if isinstance(v, list):
+            items = ", ".join(toml_value(i) for i in v)
+            return f"[{items}]"
+        return f'"{v}"'
+
+    lines = write_toml(data)
+    print("\n".join(lines).strip())
+
+elif to_fmt == "ini":
+    config = configparser.ConfigParser()
+    for key, value in data.items():
+        if isinstance(value, dict):
+            config[key] = {k: str(v) for k, v in value.items()}
+        else:
+            if "DEFAULT" not in config:
+                config["main"] = {}
+            config["main"][key] = str(value)
+    output = io.StringIO()
+    config.write(output)
+    print(output.getvalue(), end="")
+
+else:
+    print(f"Error: unsupported output format '{to_fmt}'", file=sys.stderr)
     sys.exit(1)
+
 PYEOF
